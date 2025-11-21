@@ -76,7 +76,7 @@ oauth_states = {}
 # OAuth Config
 JIRA_OAUTH_CLIENT_ID = os.getenv("JIRA_OAUTH_CLIENT_ID")
 JIRA_OAUTH_CLIENT_SECRET = os.getenv("JIRA_OAUTH_CLIENT_SECRET") 
-JIRA_OAUTH_CALLBACK_URL = os.getenv("JIRA_OAUTH_CALLBACK_URL", "http://localhost:8000/api/jira/callback")
+JIRA_OAUTH_CALLBACK_URL = os.getenv("JIRA_OAUTH_CALLBACK_URL")
 
 
 
@@ -200,14 +200,13 @@ app = FastAPI(title="HealthCase AI Agent API")
 
 
 origins = [
-    "https://frontend-app-983620134812.us-east4.run.app",
+    "https://fastapi-agent-frontend-342811635923.us-east4.run.app",
     "http://localhost:5173",
-    "*",
 ]
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins, # Use the corrected list
+    CORSMiddleware, 
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -875,9 +874,28 @@ async def jira_callback(code: str, state: str):
         "redirect_uri": JIRA_OAUTH_CALLBACK_URL
     }
     
+    print("CLIENT_ID present:", bool(JIRA_OAUTH_CLIENT_ID))
+    print("CLIENT_SECRET present:", bool(JIRA_OAUTH_CLIENT_SECRET))
+    print("CALLBACK URL:", JIRA_OAUTH_CALLBACK_URL)
+
+    print("Token request payload (safe):", {
+        "grant_type": payload["grant_type"],
+        "client_id_present": bool(payload["client_id"]),
+        "redirect_uri": payload["redirect_uri"],
+        "code_present": bool(payload["code"]),
+    })
+
     response = requests.post(token_url, json=payload)
+    print("Token response status:", response.status_code)
+    print("Token response body:", response.text)
     response.raise_for_status()
+
+    
+    # response = requests.post(token_url, json=payload)
+    # response.raise_for_status()
     tokens = response.json()
+    
+    print("tokens received:", {k: (v if k != "access_token" else "****") for k, v in tokens.items()})
     
     # Get Jira instance
     resources_url = "https://api.atlassian.com/oauth/token/accessible-resources"
@@ -923,6 +941,87 @@ async def jira_callback(code: str, state: str):
     finally:
         db.close()
 
+
+class JiraCallbackPayload(BaseModel):
+    user_id: str
+    code: str
+    
+    
+    
+@app.post("/api/jira/callback")
+async def jira_callback_post(payload: JiraCallbackPayload):
+    """
+    Receives the auth code from the Frontend and exchanges it for a token.
+    """
+    # 1. Exchange code for tokens
+    token_url = "https://auth.atlassian.com/oauth/token"
+    token_payload = {
+        "grant_type": "authorization_code",
+        "client_id": JIRA_OAUTH_CLIENT_ID,
+        "client_secret": JIRA_OAUTH_CLIENT_SECRET,
+        "code": payload.code,
+        "redirect_uri": JIRA_OAUTH_CALLBACK_URL # Ensure this matches what you set in Jira Console
+    }
+
+    try:
+        # We use requests or httpx here. Since you used requests in the GET route:
+        response = requests.post(token_url, json=token_payload)
+        response.raise_for_status()
+        tokens = response.json()
+
+        # 2. Get Jira Instance ID (Cloud ID)
+        resources_url = "https://api.atlassian.com/oauth/token/accessible-resources"
+        headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+        resources_resp = requests.get(resources_url, headers=headers)
+        resources_resp.raise_for_status()
+        resources = resources_resp.json()
+
+        if not resources:
+            raise HTTPException(status_code=400, detail="No Jira instances found for this user.")
+        
+        jira_resource = resources[0] # Taking the first available Jira site
+
+        # 3. Save to Database
+        db = SessionLocal()
+        try:
+            # Check if user already has a connection
+            existing = db.query(JiraConnection).filter(
+                JiraConnection.user_id == payload.user_id
+            ).first()
+
+            expires_in = tokens.get("expires_in", 3600)
+            
+            if existing:
+                existing.access_token = tokens["access_token"]
+                existing.refresh_token = tokens.get("refresh_token")
+                existing.token_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+                existing.jira_cloud_id = jira_resource["id"]
+                existing.jira_base_url = jira_resource["url"]
+                existing.is_active = True
+            else:
+                conn = JiraConnection(
+                    user_id=payload.user_id,
+                    jira_cloud_id=jira_resource["id"],
+                    jira_base_url=jira_resource["url"],
+                    access_token=tokens["access_token"],
+                    refresh_token=tokens.get("refresh_token"),
+                    token_expires_at=datetime.utcnow() + timedelta(seconds=expires_in)
+                )
+                db.add(conn)
+            
+            db.commit()
+            return {"status": "success", "connected": True}
+            
+        except Exception as db_e:
+            db.rollback()
+            raise db_e
+        finally:
+            db.close()
+
+    except Exception as e:
+        print(f"Error in Jira Callback: {e}")
+        # Return 500 so frontend knows it failed
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/jira/status")
 async def jira_status(user_id: str):
