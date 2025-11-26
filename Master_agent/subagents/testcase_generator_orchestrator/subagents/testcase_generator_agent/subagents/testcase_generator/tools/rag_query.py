@@ -59,9 +59,6 @@ def rag_query(
             }
             
             
-        
-    # Try to extract session context from kwargs
-    
         session_id = None
         user_id = None
 
@@ -88,9 +85,13 @@ def rag_query(
                     user_id = tool_context.user_id
 
             except Exception as ctx_error:
-                print(f"⚠️ Error extracting context: {ctx_error}")
+                print(f"⚠ Error extracting context: {ctx_error}")
+                logging.info(f"\n\n\nError extracting context: {ctx_error}\n\n\n")
 
-        # print(f"❌ Missing context - session_id: {session_id}, user_id: {user_id}")
+        print(f"\n\n❌ Session context - session_id: {session_id}, user_id: {user_id}\n\n")
+        
+        logging.info(f"\n\nRAG Query Context - session_id: {session_id}, user_id: {user_id}\n\n")
+
 
         if not session_id or not user_id:
             print(f"❌ Missing context - session_id: {session_id}, user_id: {user_id}")
@@ -113,7 +114,7 @@ def rag_query(
             ).all()
 
             if not active_docs:
-                print("⚠️ No active documents found")
+                print("⚠ No active documents found")
                 return {
                     "status": "no_documents",
                     "message": "No active documents found in this session. Please upload and activate documents first."
@@ -127,7 +128,7 @@ def rag_query(
 
             print(f"✅ Found {len(active_docs)} active documents:")
             for doc, file_id in zip(active_docs, rag_file_ids):
-                print(f"   - {doc.filename} (File ID: {file_id})")
+                print(f"\n\n   - {doc.filename} (File ID: {file_id})\n")
         except Exception as db_error:
             print(f"❌ Database query error: {db_error}")
             return {
@@ -147,8 +148,12 @@ def rag_query(
                 continue
             rn = get_corpus_resource_name(name)
             valid_display_names.append(name)
-            if(name=="requirements"): resources.append(rag.RagResource(rag_corpus=rn, rag_file_ids=rag_file_ids))
-            else : resources.append(rag.RagResource(rag_corpus=rn))
+            if(name=="requirements"):
+                resources.append(rag.RagResource(rag_corpus=rn, rag_file_ids=rag_file_ids))
+            else:
+                resources.append(rag.RagResource(rag_corpus=rn))
+                
+        print(f"\n\n✅ resources to query: {resources}\n\n")
 
         if not resources:
             return {
@@ -159,6 +164,8 @@ def rag_query(
                 "results": [],
                 "results_count": 0,
             }
+            
+            
             
         rag_retrieval_config = rag.RagRetrievalConfig(
             top_k=DEFAULT_TOP_K,

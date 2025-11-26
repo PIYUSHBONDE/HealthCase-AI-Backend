@@ -5,7 +5,7 @@ import httpx
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 import vertexai
 from vertexai import agent_engines
@@ -34,7 +34,8 @@ from models import (
     Document,
     JiraConnection,
     RequirementTrace,
-    ConversationHistory
+    ConversationHistory,
+    TestCaseExport
 )
 
 from jira_service import (
@@ -188,6 +189,26 @@ try:
             ALTER COLUMN access_token TYPE VARCHAR(3000),
             ALTER COLUMN refresh_token TYPE VARCHAR(3000);
         """))
+        
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS testcase_exports (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(255),
+                session_id VARCHAR(255),
+                testcase_id VARCHAR(255),
+                title VARCHAR(255),
+                risk VARCHAR(255),
+                testcase_data JSONB,
+                jira_key VARCHAR(255),
+                jira_url VARCHAR(500),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """))
+
+        # Create Indexes for the new table
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tc_export_user ON testcase_exports(user_id);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tc_export_session ON testcase_exports(session_id);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tc_export_tc_id ON testcase_exports(testcase_id);"))
                 
         conn.commit()
 
@@ -441,6 +462,7 @@ async def send_message(session_id: str, req: SendMessageRequest):
         # print("Agent final state:", agent_state)
 
         # Use .get() with default values - much cleaner!
+        # print("Agent final state:", agent_state)
         final_summary = agent_state.get("final_summary") or "Agent was unable to process the request. Please try again."
 
         aggregated_testcases = agent_state.get("aggregated_testcases") or [
@@ -1069,12 +1091,51 @@ async def fetch_requirements(data: dict):
 @app.post("/api/jira/create-jira-test-case")
 async def create_test_case_oauth(data: dict):
     """Create test case (OAuth)."""
-    return create_jira_test_case(
-        user_id=data["user_id"],
-        project_key=data["project_key"],
-        test_case=data["test_case"],
-        requirement_key=data.get("requirement_key")
-    )
+    # Expected data: { user_id, project_key, test_case: {...}, session_id?, testcase_id?, requirement_key? }
+    db = SessionLocal()
+    try:
+        user_id = data.get("user_id")
+        project_key = data.get("project_key")
+        test_case = data.get("test_case")
+        requirement_key = data.get("requirement_key")
+        session_id = data.get("session_id") or (test_case or {}).get("session_id")
+        testcase_id = data.get("testcase_id") or (test_case or {}).get("id")
+
+        # Call Jira service to create the issue
+        result = create_jira_test_case(
+            user_id=user_id,
+            project_key=project_key,
+            test_case=test_case or {},
+            requirement_key=requirement_key
+        )
+
+        # If creation succeeded, persist an export record so UI can show permanent success
+        if isinstance(result, dict) and result.get("status") == "success":
+            try:
+                export = TestCaseExport(
+                    user_id=user_id,
+                    session_id=session_id,
+                    testcase_id=str(testcase_id) if testcase_id is not None else None,
+                    title=(test_case or {}).get("title"),
+                    risk=(test_case or {}).get("risk"),
+                    testcase_data=test_case or {},
+                    jira_key=result.get("jira_key"),
+                    jira_url=result.get("jira_url")
+                )
+                db.add(export)
+                db.commit()
+                # Return enriched response including saved export id
+                return {**result, "export_id": export.id}
+            except Exception as db_e:
+                db.rollback()
+                # Log but still return the jira result so frontend can show link
+                print(f"❌ Failed to save TestCaseExport: {db_e}")
+                return {**result, "export_id": None, "warning": "failed_to_persist_export"}
+
+        # Propagate errors from Jira service
+        return result
+    finally:
+        db.close()
     
 # main.py - SIMPLE IMPORT ENDPOINT
 
@@ -1166,11 +1227,226 @@ async def import_jira_requirements(background_tasks: BackgroundTasks, data: dict
         db.close()
 
 
+# New endpoint: get exports for a session so frontend can show persisted Jira links
+@app.get("/api/jira/exports")
+async def get_jira_exports(session_id: str, user_id: str):
+    """Retrieve all Jira exports for a given session and user."""
+    db = SessionLocal()
+    try:
+        exports = db.query(TestCaseExport).filter(
+            TestCaseExport.session_id == session_id,
+            TestCaseExport.user_id == user_id
+        ).order_by(TestCaseExport.created_at.desc()).all()
+
+        return {
+            "exports": [
+                {
+                    "id": e.id,
+                    "testcase_id": e.testcase_id,
+                    "title": e.title,
+                    "risk": e.risk,
+                    "jira_key": e.jira_key,
+                    "jira_url": e.jira_url,
+                    "testcase_data": e.testcase_data,
+                    "created_at": e.created_at.isoformat() if e.created_at else None
+                }
+                for e in exports
+            ],
+            "total": len(exports)
+        }
+    except Exception as e:
+        print(f"❌ Error fetching exports: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+# --- Analytics endpoints ---
+@app.get("/api/analytics/overview")
+async def analytics_overview(user_id: str):
+    """Return high-level analytics for a given user across sessions."""
+    db = SessionLocal()
+    try:
+        # Total distinct sessions from conversation history
+        total_sessions = db.query(ConversationHistory.session_id).filter(ConversationHistory.user_id == user_id).distinct().count()
+
+        # Total testcase exports
+        total_exports = db.query(TestCaseExport).filter(TestCaseExport.user_id == user_id).count()
+
+        # Exports by session (top 10 recent)
+        exports_by_session = (
+            db.query(TestCaseExport.session_id, func.count(TestCaseExport.id).label('count'))
+            .filter(TestCaseExport.user_id == user_id)
+            .group_by(TestCaseExport.session_id)
+            .order_by(text('count DESC'))
+            .limit(20)
+            .all()
+        )
+
+        exports_by_session_list = [
+            {"session_id": s[0], "count": s[1]} for s in exports_by_session
+        ]
+
+        # Recent exports
+        recent_exports = (
+            db.query(TestCaseExport)
+            .filter(TestCaseExport.user_id == user_id)
+            .order_by(TestCaseExport.created_at.desc())
+            .limit(10)
+            .all()
+        )
+
+        recent_exports_list = [
+            {
+                "id": e.id,
+                "session_id": e.session_id,
+                "testcase_id": e.testcase_id,
+                "title": e.title,
+                "jira_key": e.jira_key,
+                "jira_url": e.jira_url,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in recent_exports
+        ]
+
+        # Documents uploaded
+        docs_count = db.query(Document).filter(Document.user_id == user_id).count()
+
+        # Requirement traces
+        req_traces = db.query(RequirementTrace).filter(RequirementTrace.user_id == user_id).count()
+
+        overview = {
+            "total_sessions": total_sessions,
+            "total_exports": total_exports,
+            "exports_by_session": exports_by_session_list,
+            "recent_exports": recent_exports_list,
+            "documents_uploaded": docs_count,
+            "requirement_traces": req_traces,
+        }
+
+        return overview
+
+    except Exception as e:
+        print(f"❌ Analytics overview error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+@app.get("/api/analytics/session/{session_id}")
+async def analytics_session_detail(session_id: str, user_id: str):
+    """Return analytics for a specific session: messages, exports, docs, traces."""
+    db = SessionLocal()
+    try:
+        # Conversation messages
+        messages = (
+            db.query(ConversationHistory)
+            .filter(ConversationHistory.session_id == session_id, ConversationHistory.user_id == user_id)
+            .order_by(ConversationHistory.created_at.asc())
+            .all()
+        )
+
+        messages_list = [
+            {"id": m.id, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
+            for m in messages
+        ]
+
+        # Exports for session
+        exports = (
+            db.query(TestCaseExport)
+            .filter(TestCaseExport.session_id == session_id, TestCaseExport.user_id == user_id)
+            .order_by(TestCaseExport.created_at.asc())
+            .all()
+        )
+
+        exports_list = [
+            {"id": e.id, "testcase_id": e.testcase_id, "title": e.title, "jira_key": e.jira_key, "jira_url": e.jira_url, "created_at": e.created_at.isoformat() if e.created_at else None}
+            for e in exports
+        ]
+
+        # Documents for session
+        docs = (
+            db.query(Document)
+            .filter(Document.session_id == session_id, Document.user_id == user_id)
+            .order_by(Document.created_at.asc())
+            .all()
+        )
+
+        docs_list = [ {"id": d.id, "filename": d.filename, "created_at": d.created_at.isoformat() if d.created_at else None} for d in docs ]
+
+        # Requirement traces for session
+        traces = (
+            db.query(RequirementTrace)
+            .filter(RequirementTrace.session_id == session_id, RequirementTrace.user_id == user_id)
+            .order_by(RequirementTrace.created_at.asc())
+            .all()
+        )
+
+        traces_list = [ {"id": t.id, "requirement_id": t.requirement_id, "coverage": t.coverage_percentage, "created_at": t.created_at.isoformat() if t.created_at else None} for t in traces ]
+
+        return {
+            "session_id": session_id,
+            "messages": messages_list,
+            "exports": exports_list,
+            "documents": docs_list,
+            "requirement_traces": traces_list,
+            "totals": {
+                "message_count": len(messages_list),
+                "export_count": len(exports_list),
+                "document_count": len(docs_list),
+                "trace_count": len(traces_list),
+            }
+        }
+
+    except Exception as e:
+        print(f"❌ Analytics session detail error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+from sqlalchemy import func
+
+@app.get("/api/analytics/exports-timeseries")
+async def analytics_exports_timeseries(user_id: str, days: int = 30):
+    """Return exports-per-day timeseries for the last `days` days for charts."""
+    db = SessionLocal()
+    try:
+        # Build date series
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=days-1)
+
+        # Query counts grouped by date
+        rows = (
+            db.query(func.date_trunc('day', TestCaseExport.created_at).label('day'), func.count(TestCaseExport.id))
+            .filter(TestCaseExport.user_id == user_id, TestCaseExport.created_at >= start_date)
+            .group_by('day')
+            .order_by('day')
+            .all()
+        )
+
+        counts_by_day = { r[0].date().isoformat(): r[1] for r in rows }
+
+        # Fill missing dates with zero
+        series = []
+        for i in range(days):
+            d = (start_date + timedelta(days=i)).date().isoformat()
+            series.append({"date": d, "count": counts_by_day.get(d, 0)})
+
+        return {"series": series}
+
+    except Exception as e:
+        print(f"❌ Exports timeseries error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
 
 def upload_requirements_to_rag(requirements: list, session_id: str, user_id: str):
     """Background task to upload requirements to RAG corpus."""
     try:
-        # Format requirements as readable document
+        
         doc_content = "# Imported Requirements from Jira\n\n"
         
         for req in requirements:
@@ -1322,9 +1598,14 @@ async def check_duplicate_requirements(data: dict):
     
     finally:
         db.close()
+        
+        
+        
 
 
         
 @app.get("/")
 async def root():
     return {"message": "HealthCase AI Agent API is running"}
+
+

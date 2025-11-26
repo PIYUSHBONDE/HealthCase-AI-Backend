@@ -159,3 +159,27 @@ class ConversationHistory(Base):
     
     def __repr__(self):
         return f"<ConversationHistory(id={self.id}, app_name='{self.app_name}', session_id='{self.session_id}')>"
+    
+
+class TestCaseExport(Base):
+    __tablename__ = "testcase_exports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True)
+    session_id = Column(String, index=True) # Removed ForeignKey for flexibility, or keep if you have strict relations
+    
+    # Metadata for quick querying (Analytics)
+    testcase_id = Column(String, index=True)
+    title = Column(String)
+    risk = Column(String)
+    
+    # 🟢 NEW: Store the WHOLE test case object here
+    # If using Postgres: Use Column(JSON)
+    # If using SQLite: Use Column(JSON) (modern SQLAlchemy handles it) or Column(Text)
+    testcase_data = Column(JSON) 
+
+    # Jira Details
+    jira_key = Column(String)
+    jira_url = Column(String)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
