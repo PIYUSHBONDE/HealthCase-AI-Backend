@@ -209,6 +209,8 @@ try:
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tc_export_user ON testcase_exports(user_id);"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tc_export_session ON testcase_exports(session_id);"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tc_export_tc_id ON testcase_exports(testcase_id);"))
+        
+        conn.execute(text("ALTER TABLE conversation_metadata ADD COLUMN IF NOT EXISTS test_case_count INTEGER;"))
                 
         conn.commit()
 
@@ -462,7 +464,6 @@ async def send_message(session_id: str, req: SendMessageRequest):
         # print("Agent final state:", agent_state)
 
         # Use .get() with default values - much cleaner!
-        # print("Agent final state:", agent_state)
         final_summary = agent_state.get("final_summary") or "Agent was unable to process the request. Please try again."
 
         aggregated_testcases = agent_state.get("aggregated_testcases") or [
@@ -510,24 +511,55 @@ async def list_sessions(user_id: str):
     """Lists all existing sessions for a user."""
     db = SessionLocal()
     try:
-        # Query our new table, ordering by the last updated time
         sessions_metadata = db.query(ConversationMetadata).filter(
             ConversationMetadata.user_id == user_id
         ).order_by(ConversationMetadata.updated_at.desc()).all()
         
-        formatted_sessions = [{
-            "id": s.session_id, 
-            "title": s.title, 
-            "updatedAt": s.updated_at.isoformat()
-        } for s in sessions_metadata]
+        formatted_sessions = []
+        updates_needed = False
+
+        for s in sessions_metadata:
+            count = s.test_case_count
             
+            # 🟢 FALLBACK / SELF-HEALING LOGIC
+            # If count is missing (NULL), calculate it now using the fixed helper!
+            if count is None:
+                history = db.query(ConversationHistory).filter(
+                    ConversationHistory.session_id == s.session_id
+                ).all()
+                
+                max_count = 0
+                for msg in history:
+                    content = msg.content
+                    if isinstance(content, dict):
+                        aggr = content.get("aggregated_testcases", [])
+                        # This now calls the fixed "Sets" counter
+                        current = calculate_test_case_count(aggr)
+                        if current > max_count:
+                            max_count = current
+                
+                count = max_count
+                s.test_case_count = count
+                updates_needed = True
+
+            formatted_sessions.append({
+                "id": s.session_id, 
+                "title": s.title, 
+                "updatedAt": s.updated_at.isoformat(),
+                "test_case_count": count or 0 
+            })
+        
+        if updates_needed:
+            db.commit()
+
         return {"sessions": formatted_sessions}
     except Exception as e:
         print(f"Error listing sessions for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
-    
+        
+        
 @app.get("/sessions/{session_id}/messages")
 async def get_session_messages(session_id: str, user_id: str): # user_id for security
     """Gets all messages for a specific session."""
@@ -1227,67 +1259,104 @@ async def import_jira_requirements(background_tasks: BackgroundTasks, data: dict
         db.close()
 
 
-# New endpoint: get exports for a session so frontend can show persisted Jira links
 @app.get("/api/jira/exports")
-async def get_jira_exports(session_id: str, user_id: str):
-    """Retrieve all Jira exports for a given session and user."""
+async def get_jira_exports(
+    user_id: str = Query(...),
+    session_id: str = Query(None)
+):
+    """Retrieve all Jira exports for a user (optionally filtered by session)."""
     db = SessionLocal()
     try:
-        exports = db.query(TestCaseExport).filter(
-            TestCaseExport.session_id == session_id,
+        # CORRECTION 1: Use correct model attribute names (user_id, not userid)
+        query = db.query(TestCaseExport).filter(
             TestCaseExport.user_id == user_id
-        ).order_by(TestCaseExport.created_at.desc()).all()
-
+        )
+        
+        if session_id:
+            query = query.filter(TestCaseExport.session_id == session_id)
+        
+        # CORRECTION 2: Use correct created_at
+        exports = query.order_by(TestCaseExport.created_at.desc()).all()
+        
         return {
             "exports": [
                 {
                     "id": e.id,
-                    "testcase_id": e.testcase_id,
+                    "testcase_id": e.testcase_id,   # Fixed
                     "title": e.title,
                     "risk": e.risk,
-                    "jira_key": e.jira_key,
-                    "jira_url": e.jira_url,
-                    "testcase_data": e.testcase_data,
-                    "created_at": e.created_at.isoformat() if e.created_at else None
-                }
-                for e in exports
+                    "jira_key": e.jira_key,         # Fixed
+                    "jira_url": e.jira_url,         # Fixed
+                    "testcase_data": e.testcase_data, # Fixed
+                    "created_at": e.created_at.isoformat() if e.created_at else None # Fixed
+                } for e in exports
             ],
             "total": len(exports)
         }
     except Exception as e:
-        print(f"❌ Error fetching exports: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
 
 
+
 # --- Analytics endpoints ---
 @app.get("/api/analytics/overview")
 async def analytics_overview(user_id: str):
-    """Return high-level analytics for a given user across sessions."""
+    """
+    Return high-level analytics. 
+    Auto-updates 'test_case_count' in metadata if missing.
+    """
     db = SessionLocal()
     try:
-        # Total distinct sessions from conversation history
-        total_sessions = db.query(ConversationHistory.session_id).filter(ConversationHistory.user_id == user_id).distinct().count()
+        # 1. SELF-HEALING: Find sessions with NULL counts and fix them
+        # This ensures the dashboard numbers are always accurate without manual scripts.
+        unprocessed_sessions = db.query(ConversationMetadata).filter(
+            ConversationMetadata.user_id == user_id,
+            ConversationMetadata.test_case_count == None
+        ).all()
 
-        # Total testcase exports
+        if unprocessed_sessions:
+            print(f"🔄 Recalculating stats for {len(unprocessed_sessions)} sessions...")
+            for session_meta in unprocessed_sessions:
+                # Fetch full history for this session
+                history = db.query(ConversationHistory).filter(
+                    ConversationHistory.session_id == session_meta.session_id
+                ).all()
+                
+                # Logic: aggregated_testcases is usually cumulative or the latest state.
+                # We look for the maximum count found in any message in this session.
+                max_count = 0
+                for msg in history:
+                    content = msg.content
+                    if isinstance(content, dict):
+                        aggr = content.get("aggregated_testcases", [])
+                        current = calculate_test_case_count(aggr)
+                        if current > max_count:
+                            max_count = current
+                
+                # Save to Metadata so we never have to calculate this again
+                session_meta.test_case_count = max_count
+            
+            db.commit()
+
+
+        # 2. Query Analytics (Now fast and accurate)
+        total_sessions = db.query(ConversationMetadata).filter(ConversationMetadata.user_id == user_id).count()
+
+        # Sum the column we just ensured is populated
+        total_test_cases = db.query(func.sum(ConversationMetadata.test_case_count))\
+            .filter(ConversationMetadata.user_id == user_id).scalar() or 0
+
+        # Calculate Average
+        avg_test_cases = 0
+        if total_sessions > 0:
+            avg_test_cases = round(total_test_cases / total_sessions, 1)
+
+        # Other metrics (unchanged)
         total_exports = db.query(TestCaseExport).filter(TestCaseExport.user_id == user_id).count()
-
-        # Exports by session (top 10 recent)
-        exports_by_session = (
-            db.query(TestCaseExport.session_id, func.count(TestCaseExport.id).label('count'))
-            .filter(TestCaseExport.user_id == user_id)
-            .group_by(TestCaseExport.session_id)
-            .order_by(text('count DESC'))
-            .limit(20)
-            .all()
-        )
-
-        exports_by_session_list = [
-            {"session_id": s[0], "count": s[1]} for s in exports_by_session
-        ]
-
-        # Recent exports
+        
+        # Recent Exports (unchanged)
         recent_exports = (
             db.query(TestCaseExport)
             .filter(TestCaseExport.user_id == user_id)
@@ -1295,7 +1364,6 @@ async def analytics_overview(user_id: str):
             .limit(10)
             .all()
         )
-
         recent_exports_list = [
             {
                 "id": e.id,
@@ -1309,14 +1377,25 @@ async def analytics_overview(user_id: str):
             for e in recent_exports
         ]
 
-        # Documents uploaded
+        # Requirement traces (unchanged)
+        req_traces = db.query(RequirementTrace).filter(RequirementTrace.user_id == user_id).count()
         docs_count = db.query(Document).filter(Document.user_id == user_id).count()
 
-        # Requirement traces
-        req_traces = db.query(RequirementTrace).filter(RequirementTrace.user_id == user_id).count()
+        # Exports by session (unchanged)
+        exports_by_session = (
+            db.query(TestCaseExport.session_id, func.count(TestCaseExport.id).label('count'))
+            .filter(TestCaseExport.user_id == user_id)
+            .group_by(TestCaseExport.session_id)
+            .order_by(text('count DESC'))
+            .limit(20)
+            .all()
+        )
+        exports_by_session_list = [{"session_id": s[0], "count": s[1]} for s in exports_by_session]
 
-        overview = {
+        return {
             "total_sessions": total_sessions,
+            "total_test_cases": total_test_cases,         # ✅ Corrected
+            "avg_test_cases_per_session": avg_test_cases, # ✅ Corrected
             "total_exports": total_exports,
             "exports_by_session": exports_by_session_list,
             "recent_exports": recent_exports_list,
@@ -1324,15 +1403,14 @@ async def analytics_overview(user_id: str):
             "requirement_traces": req_traces,
         }
 
-        return overview
-
     except Exception as e:
         print(f"❌ Analytics overview error: {e}")
+        db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
-
-
+        
+        
 @app.get("/api/analytics/session/{session_id}")
 async def analytics_session_detail(session_id: str, user_id: str):
     """Return analytics for a specific session: messages, exports, docs, traces."""
@@ -1601,11 +1679,23 @@ async def check_duplicate_requirements(data: dict):
         
         
         
+# In main.py, replace the calculate_test_case_count function
+
+def calculate_test_case_count(aggregated_testcases: list) -> int:
+    """
+    Counts the number of Test Sets (Suites) generated.
+    Returns the length of the list (e.g., 2 sets).
+    """
+    if aggregated_testcases and isinstance(aggregated_testcases, list):
+        return len(aggregated_testcases)
+    return 0
 
 
         
 @app.get("/")
 async def root():
     return {"message": "HealthCase AI Agent API is running"}
+
+
 
 
