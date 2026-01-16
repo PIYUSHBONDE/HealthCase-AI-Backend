@@ -7,6 +7,9 @@ Drop-in compatible with your existing patterns; adds support for multiple corpor
 import logging
 from typing import List, Dict, Any
 
+from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
+from google.api_core.exceptions import ResourceExhausted
+
 from google.adk.tools.tool_context import ToolContext
 from vertexai import rag
 
@@ -15,7 +18,11 @@ DEFAULT_TOP_K = 5
 
 from .utils import check_corpus_exists, get_corpus_resource_name
 
-
+@retry(
+    wait=wait_random_exponential(multiplier=1, max=30),
+    stop=stop_after_attempt(5),
+    retry=retry_if_exception_type(ResourceExhausted)
+)
 def rag_query(
     corpora: List[str],  # display names; may be empty to use current_corpus
     query: str,

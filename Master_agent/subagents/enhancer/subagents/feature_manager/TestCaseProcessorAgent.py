@@ -6,7 +6,9 @@ from typing_extensions import override
 from google.adk.agents import BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
-
+import time
+from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception_type
+from google.api_core.exceptions import ResourceExhausted
 import uuid
 import json
 import logging
@@ -14,7 +16,11 @@ from vertexai.generative_models import GenerativeModel
 
 logger = logging.getLogger(__name__)
 
-
+@retry(
+    wait=wait_random_exponential(multiplier=2, max=60),  # Wait 2s, 4s, 8s... up to 60s
+    stop=stop_after_attempt(10),  # Retry 10 times before failing
+    retry=retry_if_exception_type(ResourceExhausted)  # Only retry on 429 errors
+)
 async def summarize_testcases_from_markdown(
     current_testcases: str, 
     model_name: str = "gemini-2.0-flash"
@@ -213,6 +219,11 @@ def generate_fallback_summary_from_markdown(current_testcases: str) -> str:
         
         return "\n".join(summary_lines)
 
+@retry(
+    wait=wait_random_exponential(multiplier=2, max=60),  # Wait 2s, 4s, 8s... up to 60s
+    stop=stop_after_attempt(10),  # Retry 10 times before failing
+    retry=retry_if_exception_type(ResourceExhausted)  # Only retry on 429 errors
+)
 async def parse_testcases_to_json(current_testcases: str, model_name: str = "gemini-2.0-flash") -> dict:
     """
     Parses markdown table test cases into structured JSON format using Vertex AI.

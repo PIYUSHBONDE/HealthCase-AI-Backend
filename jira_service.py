@@ -155,7 +155,6 @@ def fetch_jira_requirements(user_id: str, project_key: str):
         print(f"❌ Fetch requirements error: {e}")
         return {"error": f"Failed to fetch requirements: {str(e)}"}
 
-
 def create_jira_test_case(user_id: str, project_key: str, test_case: dict, requirement_key: str = None):
     """Create a Jira issue for a test case."""
     conn = get_valid_connection(user_id)
@@ -169,49 +168,113 @@ def create_jira_test_case(user_id: str, project_key: str, test_case: dict, requi
             "Content-Type": "application/json"
         }
 
-        # Build description using Atlassian Document Format (ADF)
-        steps_nodes = []
-        for i, step in enumerate(test_case.get("steps", []), 1):
-            steps_nodes.append({
-                "type": "listItem",
-                "content": [
-                    {"type": "paragraph", "content": [{"type": "text", "text": step}]}
-                ]
+        # --- BUILD ADF DESCRIPTION ---
+        content = []
+
+        # 1. Title Heading
+        content.append({
+            "type": "heading",
+            "attrs": {"level": 2},
+            "content": [{"type": "text", "text": test_case.get("title", "Test Case")}]
+        })
+
+        # 2. Metadata Panel (ID, Risk, Regulatory Refs)
+        reg_refs = test_case.get("regulatory_refs", [])
+        reg_refs_str = ", ".join(reg_refs) if isinstance(reg_refs, list) else str(reg_refs or "N/A")
+        
+        panel_content = [
+            {"type": "listItem", "content": [{"type": "paragraph", "content": [
+                {"type": "text", "text": "ID: ", "marks": [{"type": "strong"}]},
+                {"type": "text", "text": str(test_case.get("id", "N/A"))}
+            ]}]},
+            {"type": "listItem", "content": [{"type": "paragraph", "content": [
+                {"type": "text", "text": "Risk: ", "marks": [{"type": "strong"}]},
+                {"type": "text", "text": str(test_case.get("risk", "N/A"))}
+            ]}]},
+            {"type": "listItem", "content": [{"type": "paragraph", "content": [
+                {"type": "text", "text": "Regulatory Refs: ", "marks": [{"type": "strong"}]},
+                {"type": "text", "text": reg_refs_str}
+            ]}]}
+        ]
+        
+        content.append({
+            "type": "panel",
+            "attrs": {"panelType": "info"},
+            "content": [{
+                "type": "bulletList",
+                "content": panel_content
+            }]
+        })
+
+        # 3. Rationale (if present)
+        if test_case.get("rationale"):
+            content.append({
+                "type": "paragraph", 
+                "content": [{"type": "text", "text": "Rationale:", "marks": [{"type": "strong"}]}]
+            })
+            content.append({
+                "type": "blockquote",
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": test_case["rationale"]}]}]
             })
 
-        description_content = [
-            {
-                "type": "heading", "attrs": {"level": 2},
-                "content": [{"type": "text", "text": "Test Steps"}]
-            },
-            {
-                "type": "orderedList",
-                "content": steps_nodes
-            },
-            {
-                "type": "heading", "attrs": {"level": 2},
-                "content": [{"type": "text", "text": "Expected Result"}]
-            },
-            {
-                "type": "paragraph",
-                "content": [{"type": "text", "text": test_case.get('expected', 'N/A')}]
-            }
-        ]
-
-        # Add Preconditions if they exist
-        if test_case.get("preconditions"):
-            preconditions_nodes = []
-            for pre in test_case.get("preconditions", []):
-                preconditions_nodes.append({
+        # 4. Preconditions (if present)
+        preconditions = test_case.get("preconditions", [])
+        if preconditions:
+            content.append({
+                "type": "heading", "attrs": {"level": 3},
+                "content": [{"type": "text", "text": "Preconditions"}]
+            })
+            pc_nodes = []
+            for p in preconditions:
+                pc_nodes.append({
                     "type": "listItem",
+                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": p}]}]
+                })
+            content.append({"type": "bulletList", "content": pc_nodes})
+
+        # 5. Test Steps Table
+        step_details = test_case.get("stepDetails", [])
+        
+        # Fallback to old format if stepDetails is missing
+        if not step_details and test_case.get("steps"):
+            steps = test_case.get("steps", [])
+            expected = test_case.get("expected", "")
+            step_details = [{"step": s, "expected": (expected if i == len(steps)-1 else "")} for i, s in enumerate(steps)]
+
+        if step_details:
+            content.append({
+                "type": "heading", "attrs": {"level": 3},
+                "content": [{"type": "text", "text": "Test Steps"}]
+            })
+
+            # Table Header
+            table_rows = [{
+                "type": "tableRow",
+                "content": [
+                    {"type": "tableHeader", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": "#"}]}]},
+                    {"type": "tableHeader", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Step Description"}]}]},
+                    {"type": "tableHeader", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Expected Result"}]}]}
+                ]
+            }]
+
+            # Table Rows
+            for idx, sd in enumerate(step_details, 1):
+                s_text = sd.get("step", "")
+                e_text = sd.get("expected", "")
+                table_rows.append({
+                    "type": "tableRow",
                     "content": [
-                        {"type": "paragraph", "content": [{"type": "text", "text": pre}]}
+                        {"type": "tableCell", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": str(idx)}]}]},
+                        {"type": "tableCell", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": s_text}]}]},
+                        {"type": "tableCell", "attrs": {}, "content": [{"type": "paragraph", "content": [{"type": "text", "text": e_text}]}]}
                     ]
                 })
-            
-            description_content.insert(0, {"type": "bulletList", "content": preconditions_nodes})
-            description_content.insert(0, {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "Preconditions"}]})
 
+            content.append({
+                "type": "table",
+                "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+                "content": table_rows
+            })
 
         payload = {
             "fields": {
@@ -220,12 +283,11 @@ def create_jira_test_case(user_id: str, project_key: str, test_case: dict, requi
                 "description": {
                     "type": "doc",
                     "version": 1,
-                    "content": description_content
+                    "content": content
                 },
                 "issuetype": {"name": "Task"},
                 "labels": ["healthcase-ai", "testcase"]
             },
-            # --- THIS IS THE NEW SECTION TO CREATE THE LINK ---
             "update": {}
         }
 
@@ -241,7 +303,6 @@ def create_jira_test_case(user_id: str, project_key: str, test_case: dict, requi
                     }
                 ]
             }
-        # --- END OF NEW SECTION ---
         
         response = requests.post(url, headers=headers, json=payload)
         

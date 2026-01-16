@@ -20,11 +20,22 @@ from google.genai import types
 from google.cloud import storage
 from vertexai import rag
 from fastapi import BackgroundTasks
-import requests
 
+import requests
+import logging
 import uuid
 from sqlalchemy import text
 
+from tenacity import AsyncRetrying, stop_after_attempt, wait_random_exponential, retry_if_exception_type
+from google.api_core.exceptions import ResourceExhausted
+
+from tenacity import (
+    AsyncRetrying, 
+    stop_after_attempt, 
+    wait_fixed,
+    retry_if_exception,
+    before_sleep_log
+)
 
 from models import (
     Base,
@@ -52,6 +63,8 @@ from Master_agent.agent import root_agent
 
 # --- 1. SETUP ---
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # GCS Client Setup
 storage_client = storage.Client()
@@ -431,73 +444,147 @@ async def create_new_session(req: NewSessionRequest):
     finally:
         db.close()
     
+# @app.post("/sessions/{session_id}/messages")
+# async def send_message(session_id: str, req: SendMessageRequest):
+#     """Sends a message to an existing session and gets the agent's response."""
+#     db = SessionLocal()
+#     try:
+#         content = types.Content(role="user", parts=[types.Part(text=req.message)])
+#         final_response_text = ""
+        
+#         new_conversation = ConversationHistory(
+#             app_name=runner.app_name,
+#             user_id=req.user_id,
+#             session_id=session_id,
+#             content={"role": "user", "text": req.message, "aggregated_testcases": [], }
+#         )
+#         db.add(new_conversation)
+        
+#         async for event in runner.run_async(
+#             user_id=req.user_id, session_id=session_id, new_message=content
+#         ):
+            
+#         #     # if event.actions and event.actions.escalate and event.actions.state_delta and hasattr(event.actions.state_delta, "aggregated_testcases"):
+#         #     #     final_response_text = event.actions.state_delta["aggregated_testcases"]
+#         #     #     print("Final response received:\n",final_response_text)
+#             pass
+        
+#         session = await session_service.get_session(
+#             app_name=runner.app_name, user_id=req.user_id, session_id=session_id
+#         )
+#         agent_state = session.state
+
+#         # print("Agent final state:", agent_state)
+
+#         # Use .get() with default values - much cleaner!
+#         final_summary = agent_state.get("final_summary") or "Agent was unable to process the request. Please try again."
+
+#         aggregated_testcases = agent_state.get("aggregated_testcases") or [
+#             {"testcase_id": "N/A", "Testcase Title": "No test cases generated.", 
+#              "testcases":[],"compliance_ids":[]}
+#         ]
+        
+#         new_conversation = ConversationHistory(
+#             app_name=runner.app_name,
+#             user_id=req.user_id,
+#             session_id=session_id,
+#             content={"role": "assistant", "text": final_summary, "aggregated_testcases": aggregated_testcases, }
+#         )
+        
+#         db.add(new_conversation)
+#         db.commit()
+        
+#         # --- NEW: Update our metadata table ---
+#         updated_title = None
+#         session_metadata = db.query(ConversationMetadata).filter(
+#             ConversationMetadata.session_id == session_id,
+#             ConversationMetadata.user_id == req.user_id
+#         ).first()
+
+#         if session_metadata:
+#             session_metadata.updated_at = datetime.now(timezone.utc)
+#             if session_metadata.title == "New Conversation":
+#                 new_title = req.message[:50]
+#                 session_metadata.title = new_title
+#                 updated_title = new_title
+            
+#             db.commit()
+        
+#         return {"role": "assistant", "text": final_summary, "updated_title": updated_title, "aggregated_testcases": aggregated_testcases}
+#     except Exception as e:
+#         print(f"Error listing sessions for user : {e}")
+#         db.rollback()
+#         raise HTTPException(status_code=500, detail=str(e))
+#     finally:
+#         db.close()
+
 @app.post("/sessions/{session_id}/messages")
 async def send_message(session_id: str, req: SendMessageRequest):
     """Sends a message to an existing session and gets the agent's response."""
     db = SessionLocal()
+    
     try:
-        content = types.Content(role="user", parts=[types.Part(text=req.message)])
-        final_response_text = ""
-        
-        new_conversation = ConversationHistory(
-            app_name=runner.app_name,
-            user_id=req.user_id,
-            session_id=session_id,
-            content={"role": "user", "text": req.message, "aggregated_testcases": [], }
-        )
-        db.add(new_conversation)
-        
-        async for event in runner.run_async(
-            user_id=req.user_id, session_id=session_id, new_message=content
+        # Retry once (2 total attempts) with 15-second wait
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(5), 
+            wait=wait_random_exponential(multiplier=2, max=60), 
+            retry=retry_if_exception_type(ResourceExhausted),
+            reraise=True
         ):
-            
-        #     # if event.actions and event.actions.escalate and event.actions.state_delta and hasattr(event.actions.state_delta, "aggregated_testcases"):
-        #     #     final_response_text = event.actions.state_delta["aggregated_testcases"]
-        #     #     print("Final response received:\n",final_response_text)
-            pass
-        
-        session = await session_service.get_session(
-            app_name=runner.app_name, user_id=req.user_id, session_id=session_id
-        )
-        agent_state = session.state
+            with attempt:
+                content = types.Content(role="user", parts=[types.Part(text=req.message)])
+                
+                new_conversation = ConversationHistory(
+                    app_name=runner.app_name,
+                    user_id=req.user_id,
+                    session_id=session_id,
+                    content={"role": "user", "text": req.message, "aggregated_testcases": [], }
+                )
+                db.add(new_conversation)
+                
+                async for event in runner.run_async(
+                    user_id=req.user_id, session_id=session_id, new_message=content
+                ):pass
+                    # logging.info(f"\n\n\nAction in state{event}\n\n\n")
+                    # print(f"\n\nAction in state{event}\n\n\n")
+                
+                session = await session_service.get_session(
+                    app_name=runner.app_name, user_id=req.user_id, session_id=session_id
+                )
+                agent_state = session.state
 
-        # print("Agent final state:", agent_state)
+                final_summary = agent_state.get("final_summary") or "Agent was unable to process the request. Please try again."
+                aggregated_testcases = agent_state.get("aggregated_testcases") or [
+                    {"testcase_id": "N/A", "Testcase Title": "No test cases generated.", 
+                     "testcases":[],"compliance_ids":[]}
+                ]
+                
+                new_conversation = ConversationHistory(
+                    app_name=runner.app_name,
+                    user_id=req.user_id,
+                    session_id=session_id,
+                    content={"role": "assistant", "text": final_summary, "aggregated_testcases": aggregated_testcases, }
+                )
+                
+                db.add(new_conversation)
+                db.commit()
+                
+                updated_title = None
+                session_metadata = db.query(ConversationMetadata).filter(
+                    ConversationMetadata.session_id == session_id,
+                    ConversationMetadata.user_id == req.user_id
+                ).first()
 
-        # Use .get() with default values - much cleaner!
-        final_summary = agent_state.get("final_summary") or "Agent was unable to process the request. Please try again."
-
-        aggregated_testcases = agent_state.get("aggregated_testcases") or [
-            {"testcase_id": "N/A", "Testcase Title": "No test cases generated.", 
-             "testcases":[],"compliance_ids":[]}
-        ]
-        
-        new_conversation = ConversationHistory(
-            app_name=runner.app_name,
-            user_id=req.user_id,
-            session_id=session_id,
-            content={"role": "assistant", "text": final_summary, "aggregated_testcases": aggregated_testcases, }
-        )
-        
-        db.add(new_conversation)
-        db.commit()
-        
-        # --- NEW: Update our metadata table ---
-        updated_title = None
-        session_metadata = db.query(ConversationMetadata).filter(
-            ConversationMetadata.session_id == session_id,
-            ConversationMetadata.user_id == req.user_id
-        ).first()
-
-        if session_metadata:
-            session_metadata.updated_at = datetime.now(timezone.utc)
-            if session_metadata.title == "New Conversation":
-                new_title = req.message[:50]
-                session_metadata.title = new_title
-                updated_title = new_title
-            
-            db.commit()
-        
-        return {"role": "assistant", "text": final_summary, "updated_title": updated_title, "aggregated_testcases": aggregated_testcases}
+                if session_metadata:
+                    session_metadata.updated_at = datetime.now(timezone.utc)
+                    if session_metadata.title == "New Conversation":
+                        new_title = req.message[:50]
+                        session_metadata.title = new_title
+                        updated_title = new_title
+                    db.commit()
+                
+                return {"role": "assistant", "text": final_summary, "updated_title": updated_title, "aggregated_testcases": aggregated_testcases}
+                
     except Exception as e:
         print(f"Error listing sessions for user : {e}")
         db.rollback()
@@ -629,35 +716,127 @@ async def rename_session_title(session_id: str, payload: RenamePayload, user_id:
 
 # ========== RAG DOCUMENT ENDPOINTS ==========
 
+# @app.post("/api/rag/upload")
+# async def upload_document_rag(
+#     background_tasks: BackgroundTasks, 
+#     file: UploadFile = File(...),
+#     user_id: str = Form(...),
+#     session_id: str = Form(...)  # Frontend is sending this
+# ):
+#     """
+#     (Simplified) Uploads a document and links it to a session.
+#     This version just creates the database record so it appears in the UI.
+#     """
+#     if not BUCKET_NAME:
+#          raise HTTPException(status_code=500, detail="GCS Bucket name not configured.")
+     
+#     db = SessionLocal()
+#     try:
+#         # 1. Upload to GCS
+#         bucket = storage_client.bucket(BUCKET_NAME)
+#         # Create a unique path, maybe including user/session ID
+#         blob_name = f"user_{user_id}/session_{session_id}/{uuid.uuid4()}_{file.filename}"
+#         blob = bucket.blob(blob_name)
+        
+#         contents = await file.read()
+#         blob.upload_from_string(contents, content_type=file.content_type)
+#         gcs_uri = f"gs://{BUCKET_NAME}/{blob_name}"
+        
+#         print(f"✅ File uploaded to GCS: {gcs_uri}")
+        
+#         # Create a placeholder document record
+#         doc_id = str(uuid.uuid4())
+#         new_doc = Document(
+#             id=str(doc_id),
+#             filename=file.filename,
+#             user_id=user_id,
+#             session_id=session_id,
+#             is_active=True,
+#             status='processing',
+#             # Simulating some data for the UI
+#             total_pages=0, 
+#             chunk_count=0,
+#             gcs_uri=gcs_uri,
+#             document_summary="Processing document...",
+#             rag_file_id=None
+#         )
+#         db.add(new_doc)
+#         db.commit()
+#         db.refresh(new_doc)
+
+#         print(f"✅ (Simplified Upload) Saved doc {new_doc.id} to session {session_id}")
+        
+#         # 3. Import to RAG Engine (async in background)
+#         background_tasks.add_task(
+#             import_to_rag_engine,
+#             doc_id=str(doc_id),
+#             gcs_uri=gcs_uri,
+#             user_id=user_id,
+#             session_id=session_id,
+#             filename=file.filename
+#         )
+
+#         return {
+#             "status": "success",
+#             "document_id": new_doc.id,
+#             "filename": new_doc.filename,
+#             "gcs_uri": gcs_uri,
+#             "message": "Document uploaded and is processing."
+#         }
+#         # --- END OF SIMPLIFIED VERSION ---
+    
+#     except Exception as e:
+#         db.rollback() # Rollback DB changes if GCS upload or DB save fails
+#         print(f"❌ RAG Upload Error: {e}")
+#         # Attempt to delete the GCS file if DB save failed
+#         if blob:
+#             try:
+#                 print(f"   -> Attempting to clean up GCS blob: {blob.name}")
+#                 blob.delete()
+#                 print(f"   -> GCS blob deleted.")
+#             except Exception as delete_e:
+#                 print(f"   -> Failed to delete GCS blob {blob.name}: {delete_e}")
+#         import traceback
+#         traceback.print_exc()
+#         raise HTTPException(status_code=500, detail=f"Failed to upload document: {e}")
+#     finally:
+#         db.close()
+
 @app.post("/api/rag/upload")
 async def upload_document_rag(
-    background_tasks: BackgroundTasks, 
+    # ❌ REMOVE: background_tasks: BackgroundTasks, 
     file: UploadFile = File(...),
     user_id: str = Form(...),
-    session_id: str = Form(...)  # Frontend is sending this
+    session_id: str = Form(...) 
 ):
     """
-    (Simplified) Uploads a document and links it to a session.
-    This version just creates the database record so it appears in the UI.
+    Uploads a document and synchronously imports it to RAG Engine.
+    This ensures the frontend waits until the import is TRULY complete before sending the next file.
     """
     if not BUCKET_NAME:
          raise HTTPException(status_code=500, detail="GCS Bucket name not configured.")
      
     db = SessionLocal()
+    blob = None 
     try:
         # 1. Upload to GCS
         bucket = storage_client.bucket(BUCKET_NAME)
-        # Create a unique path, maybe including user/session ID
         blob_name = f"user_{user_id}/session_{session_id}/{uuid.uuid4()}_{file.filename}"
         blob = bucket.blob(blob_name)
         
         contents = await file.read()
-        blob.upload_from_string(contents, content_type=file.content_type)
+        
+        # Run GCS upload in threadpool to avoid blocking event loop
+        await run_in_threadpool(
+            blob.upload_from_string, 
+            contents, 
+            content_type=file.content_type
+        )
         gcs_uri = f"gs://{BUCKET_NAME}/{blob_name}"
         
         print(f"✅ File uploaded to GCS: {gcs_uri}")
         
-        # Create a placeholder document record
+        # 2. Create DB Record
         doc_id = str(uuid.uuid4())
         new_doc = Document(
             id=str(doc_id),
@@ -666,7 +845,6 @@ async def upload_document_rag(
             session_id=session_id,
             is_active=True,
             status='processing',
-            # Simulating some data for the UI
             total_pages=0, 
             chunk_count=0,
             gcs_uri=gcs_uri,
@@ -677,10 +855,12 @@ async def upload_document_rag(
         db.commit()
         db.refresh(new_doc)
 
-        print(f"✅ (Simplified Upload) Saved doc {new_doc.id} to session {session_id}")
+        print(f"✅ Saved doc {new_doc.id} to DB. Starting RAG import (Blocking)...")
         
-        # 3. Import to RAG Engine (async in background)
-        background_tasks.add_task(
+        # 3. Import to RAG Engine (BLOCKING / SYNCHRONOUS)
+        # We await this so the HTTP response is NOT sent until this finishes.
+        # This prevents the frontend from sending the next file too early.
+        await run_in_threadpool(
             import_to_rag_engine,
             doc_id=str(doc_id),
             gcs_uri=gcs_uri,
@@ -689,31 +869,41 @@ async def upload_document_rag(
             filename=file.filename
         )
 
+        # 4. Fetch the updated status (optional, just to be sure)
+        db.refresh(new_doc)
+        
+        if new_doc.status == 'failed':
+             raise HTTPException(status_code=500, detail="RAG Import failed on server side.")
+
         return {
             "status": "success",
             "document_id": new_doc.id,
             "filename": new_doc.filename,
             "gcs_uri": gcs_uri,
-            "message": "Document uploaded and is processing."
+            "message": "Document uploaded and processed successfully."
         }
-        # --- END OF SIMPLIFIED VERSION ---
     
     except Exception as e:
-        db.rollback() # Rollback DB changes if GCS upload or DB save fails
         print(f"❌ RAG Upload Error: {e}")
-        # Attempt to delete the GCS file if DB save failed
+        # Cleanup GCS if failed
         if blob:
             try:
-                print(f"   -> Attempting to clean up GCS blob: {blob.name}")
                 blob.delete()
-                print(f"   -> GCS blob deleted.")
-            except Exception as delete_e:
-                print(f"   -> Failed to delete GCS blob {blob.name}: {delete_e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to upload document: {e}")
+            except:
+                pass
+        
+        # Cleanup DB if failed
+        if 'new_doc' in locals() and new_doc.id:
+             try:
+                 db.delete(new_doc)
+                 db.commit()
+             except:
+                 pass
+
+        raise HTTPException(status_code=500, detail=f"Failed to upload document: {str(e)}")
     finally:
-        db.close()
+        db.close()      
+      
         
 def import_to_rag_engine(
     doc_id: str,

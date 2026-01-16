@@ -38,6 +38,7 @@ class ConversationMetadata(Base):
     user_id = Column(String, nullable=False)
     title = Column(String, nullable=False)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+    test_case_count = Column(Integer, nullable=True)
 
 class Document(Base):
     __tablename__ = 'documents'

@@ -11,7 +11,7 @@ from .subagents.feature_manager.TestCaseProcessorAgent import TestCaseProcessorA
 # Create the Testcase Generator Loop Agent
 testcase_generator_loop = LoopAgent(
     name="TestcaseGeneratorLoop",
-    max_iterations=10,  
+    max_iterations=5,  
     sub_agents=[    
         testcase_generator_agent,
         TestCaseProcessorAgent(),
