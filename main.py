@@ -254,8 +254,7 @@ app = FastAPI(title="HealthCase AI Agent API")
 
 
 origins = [
-    "https://fastapi-agent-frontend-342811635923.us-east4.run.app",
-    "http://localhost:5173",
+    "https://healthcase-ai.vercel.app/"
 ]
 
 app.add_middleware(
@@ -289,61 +288,24 @@ class RenamePayload(BaseModel):
 
 # --- 2. SYNC HELPERS ---
 def call_vertex_agent(user_id: str, session_id: str, message: str) -> list:
-    # If Vertex AI or agent resource is not configured, return a safe placeholder
-    if not VERTEX_AVAILABLE or not AGENT_RESOURCE_ID:
-        print("⚠️ Skipping Vertex agent call - Vertex or AGENT_RESOURCE_ID not configured")
-        return [{"type": "info", "text": "Vertex AI disabled or not configured. No agent response."}]
-
+    remote_app = agent_engines.get(AGENT_RESOURCE_ID)
     responses = []
-    try:
-        remote_app = agent_engines.get(AGENT_RESOURCE_ID)
-        for event in remote_app.stream_query(
-            user_id=user_id, session_id=session_id, message=message
-        ):
-            responses.append(event)
-    except Exception as e:
-        print(f"⚠️ call_vertex_agent failed: {e}")
-        return [{"type": "error", "text": f"call_vertex_agent error: {e}"}]
-
+    for event in remote_app.stream_query(
+        user_id=user_id, session_id=session_id, message=message
+    ):
+        responses.append(event)
     return responses
 
 def upload_and_query_agent(contents: bytes, filename: str, user_id: str, session_id: str) -> dict:
-    # Upload to GCS if available; otherwise write to local uploads/ and return local path
-    gs_url = None
-    blob = None
-    try:
-        if USE_GCS and storage_client and BUCKET_NAME:
-            bucket = storage_client.bucket(BUCKET_NAME)
-            blob_name = f"corpus/{filename}"
-            blob = bucket.blob(blob_name)
-            blob.upload_from_string(contents)
-            gs_url = f"gs://{BUCKET_NAME}/{blob_name}"
-            print(f"✅ Uploaded to GCS: {gs_url}")
-        else:
-            # Fallback: save to local uploads directory
-            os.makedirs("uploads", exist_ok=True)
-            local_path = os.path.join("uploads", f"{uuid.uuid4()}_{filename}")
-            with open(local_path, "wb") as f:
-                f.write(contents)
-            gs_url = f"file://{os.path.abspath(local_path)}"
-            print(f"ℹ️ GCS unavailable - saved file locally: {gs_url}")
+    client = storage.Client()
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(f"corpus/{filename}")
+    blob.upload_from_string(contents)
+    gs_url = f"gs://{BUCKET_NAME}/corpus/{filename}"
 
-    except Exception as e:
-        print(f"⚠️ upload failed: {e}")
-        # best-effort fallback to local
-        os.makedirs("uploads", exist_ok=True)
-        local_path = os.path.join("uploads", f"{uuid.uuid4()}_{filename}")
-        with open(local_path, "wb") as f:
-            f.write(contents)
-        gs_url = f"file://{os.path.abspath(local_path)}"
-
-    # If Vertex is available, notify the agent about the new document; otherwise return placeholder
     message_text = f"Please add this document to the Requirements Corpus: {gs_url}"
-    if VERTEX_AVAILABLE and AGENT_RESOURCE_ID:
-        agent_response = call_vertex_agent(user_id, session_id, message_text)
-        normalized_response = [normalize_agent_payload(event) for event in agent_response]
-    else:
-        normalized_response = [{"type": "info", "text": "Vertex AI disabled - document not added to remote corpus."}]
+    agent_response = call_vertex_agent(user_id, session_id, message_text)
+    normalized_response = [normalize_agent_payload(event) for event in agent_response]
 
     return {"gs_url": gs_url, "agent_response": normalized_response}
 
