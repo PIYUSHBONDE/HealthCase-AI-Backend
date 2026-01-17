@@ -273,30 +273,24 @@ app.add_middleware(
 ALLOWED_ORIGIN = "https://healthcase-ai.vercel.app"
 
 @app.middleware("http")
-async def block_unknown_origins(request: Request, call_next):
+async def strict_origin_guard(request: Request, call_next):
+    # ✅ 1. ALWAYS allow preflight
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     origin = request.headers.get("origin")
     referer = request.headers.get("referer")
 
-    # Allow same-origin navigations (no origin header)
+    # ❌ Block requests with no browser context
     if not origin and not referer:
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "Forbidden"}
-        )
+        return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
-    # Check Origin
+    # ❌ Block wrong origins
     if origin and origin != ALLOWED_ORIGIN:
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "Forbidden"}
-        )
+        return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
-    # Check Referer fallback
     if referer and not referer.startswith(ALLOWED_ORIGIN):
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "Forbidden"}
-        )
+        return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
     return await call_next(request)
 
