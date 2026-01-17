@@ -20,6 +20,10 @@ from google.genai import types
 from google.cloud import storage
 from vertexai import rag
 from fastapi import BackgroundTasks
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+
 
 import requests
 import logging
@@ -264,8 +268,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-from fastapi.responses import JSONResponse
 
 
 ALLOWED_ORIGIN = "https://healthcase-ai.vercel.app"
