@@ -67,8 +67,20 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # GCS Client Setup
-storage_client = storage.Client()
+storage_client = None
+USE_GCS = False
 BUCKET_NAME = os.getenv("BUCKET_NAME") # Ensure BUCKET_NAME is in your .env for uploads
+
+# Try to initialize GCS client, but fail gracefully if credentials are missing
+try:
+    from google.auth.exceptions import DefaultCredentialsError
+    storage_client = storage.Client()
+    USE_GCS = True
+    print("✅ GCS client initialized.")
+except Exception as e:
+    storage_client = None
+    USE_GCS = False
+    print(f"⚠️ GCS not available: {e}")
 
 # Agent/Vertex AI Config
 AGENT_RESOURCE_ID = os.getenv("AGENT_RESOURCE_ID") # Keep if using remote agent engines elsewhere
@@ -98,13 +110,19 @@ RAG_CORPUS_ID = os.getenv("DATA_STORE_ID")
 RAG_CORPUS_NAME = f"projects/{GOOGLE_CLOUD_PROJECT}/locations/{GOOGLE_CLOUD_LOCATION}/ragCorpora/{RAG_CORPUS_ID}"
 
 # Vertex AI Init (Check if project/location are loaded)
+VERTEX_AVAILABLE = False
 if GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION and GOOGLE_CLOUD_STAGING_BUCKET:
-    vertexai.init(
-        project=GOOGLE_CLOUD_PROJECT,
-        location=GOOGLE_CLOUD_LOCATION,
-        staging_bucket=GOOGLE_CLOUD_STAGING_BUCKET
-    )
-    print("✅ Vertex AI initialized.")
+    try:
+        vertexai.init(
+            project=GOOGLE_CLOUD_PROJECT,
+            location=GOOGLE_CLOUD_LOCATION,
+            staging_bucket=GOOGLE_CLOUD_STAGING_BUCKET
+        )
+        VERTEX_AVAILABLE = True
+        print("✅ Vertex AI initialized.")
+    except Exception as e:
+        VERTEX_AVAILABLE = False
+        print(f"⚠️ Vertex AI init failed: {e}")
 else:
     print("⚠️ Vertex AI NOT initialized - Missing GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, or GOOGLE_CLOUD_STAGING_BUCKET in .env")
 
@@ -271,24 +289,61 @@ class RenamePayload(BaseModel):
 
 # --- 2. SYNC HELPERS ---
 def call_vertex_agent(user_id: str, session_id: str, message: str) -> list:
-    remote_app = agent_engines.get(AGENT_RESOURCE_ID)
+    # If Vertex AI or agent resource is not configured, return a safe placeholder
+    if not VERTEX_AVAILABLE or not AGENT_RESOURCE_ID:
+        print("⚠️ Skipping Vertex agent call - Vertex or AGENT_RESOURCE_ID not configured")
+        return [{"type": "info", "text": "Vertex AI disabled or not configured. No agent response."}]
+
     responses = []
-    for event in remote_app.stream_query(
-        user_id=user_id, session_id=session_id, message=message
-    ):
-        responses.append(event)
+    try:
+        remote_app = agent_engines.get(AGENT_RESOURCE_ID)
+        for event in remote_app.stream_query(
+            user_id=user_id, session_id=session_id, message=message
+        ):
+            responses.append(event)
+    except Exception as e:
+        print(f"⚠️ call_vertex_agent failed: {e}")
+        return [{"type": "error", "text": f"call_vertex_agent error: {e}"}]
+
     return responses
 
 def upload_and_query_agent(contents: bytes, filename: str, user_id: str, session_id: str) -> dict:
-    client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(f"corpus/{filename}")
-    blob.upload_from_string(contents)
-    gs_url = f"gs://{BUCKET_NAME}/corpus/{filename}"
+    # Upload to GCS if available; otherwise write to local uploads/ and return local path
+    gs_url = None
+    blob = None
+    try:
+        if USE_GCS and storage_client and BUCKET_NAME:
+            bucket = storage_client.bucket(BUCKET_NAME)
+            blob_name = f"corpus/{filename}"
+            blob = bucket.blob(blob_name)
+            blob.upload_from_string(contents)
+            gs_url = f"gs://{BUCKET_NAME}/{blob_name}"
+            print(f"✅ Uploaded to GCS: {gs_url}")
+        else:
+            # Fallback: save to local uploads directory
+            os.makedirs("uploads", exist_ok=True)
+            local_path = os.path.join("uploads", f"{uuid.uuid4()}_{filename}")
+            with open(local_path, "wb") as f:
+                f.write(contents)
+            gs_url = f"file://{os.path.abspath(local_path)}"
+            print(f"ℹ️ GCS unavailable - saved file locally: {gs_url}")
 
+    except Exception as e:
+        print(f"⚠️ upload failed: {e}")
+        # best-effort fallback to local
+        os.makedirs("uploads", exist_ok=True)
+        local_path = os.path.join("uploads", f"{uuid.uuid4()}_{filename}")
+        with open(local_path, "wb") as f:
+            f.write(contents)
+        gs_url = f"file://{os.path.abspath(local_path)}"
+
+    # If Vertex is available, notify the agent about the new document; otherwise return placeholder
     message_text = f"Please add this document to the Requirements Corpus: {gs_url}"
-    agent_response = call_vertex_agent(user_id, session_id, message_text)
-    normalized_response = [normalize_agent_payload(event) for event in agent_response]
+    if VERTEX_AVAILABLE and AGENT_RESOURCE_ID:
+        agent_response = call_vertex_agent(user_id, session_id, message_text)
+        normalized_response = [normalize_agent_payload(event) for event in agent_response]
+    else:
+        normalized_response = [{"type": "info", "text": "Vertex AI disabled - document not added to remote corpus."}]
 
     return {"gs_url": gs_url, "agent_response": normalized_response}
 
