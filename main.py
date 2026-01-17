@@ -265,6 +265,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from fastapi.responses import JSONResponse
+
+
+ALLOWED_ORIGIN = "https://healthcase-ai.vercel.app"
+
+@app.middleware("http")
+async def block_unknown_origins(request: Request, call_next):
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+
+    # Allow same-origin navigations (no origin header)
+    if not origin and not referer:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Forbidden"}
+        )
+
+    # Check Origin
+    if origin and origin != ALLOWED_ORIGIN:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Forbidden"}
+        )
+
+    # Check Referer fallback
+    if referer and not referer.startswith(ALLOWED_ORIGIN):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Forbidden"}
+        )
+
+    return await call_next(request)
+
 class AgentRequest(BaseModel):
     user_id: str
     session_id: str
